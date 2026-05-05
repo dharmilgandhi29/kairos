@@ -1,25 +1,25 @@
 import re
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from dotenv import load_dotenv
 
 load_dotenv()
 
+
 @dataclass
 class Classification:
-    mode: str          # "system1" or "system2"
-    confidence: float  # 0.0 to 1.0
-    reasoning: str     # why this classification
+    mode: str
+    confidence: float
+    reasoning: str
     requires_citation: bool
-    source: str        # "heuristic" or "llm"
+    source: str
+    pattern_id: int = None
 
-
-# --- Layer 1: Heuristic signals ---
 
 SYSTEM1_PATTERNS = [
-    r"what is \d+[\s]*[+\-*/][\s]*\d+",  # math
+    r"what is \d+[\s]*[+\-*/][\s]*\d+",
     r"what (is|are) the (capital|population|currency) of",
     r"how (many|much) (days|hours|minutes|years)",
     r"what (day|time|date) is",
@@ -42,9 +42,10 @@ SYSTEM2_PATTERNS = [
     r"\bwhat (would|could) happen\b",
     r"\bif .+ (raises|lowers|increases|decreases|changes)\b",
     r"\b(effect|effects|impact|impacts) of\b",
-    r"\b(recession|inflation|economy|market|financial)\b.{0,30}\b(raises|lowers|crisis|crash)\b",
     r"\bhow (will|would|could|should) .+ (affect|impact|change|influence)\b",
     r"\bwhat (are|is) the (effect|impact|consequence|result) of\b",
+    r"\b(acquiring|acquisition|invest|investment|valuation)\b",
+    r"\b(wise|prudent|advisable|recommended)\b.{0,20}\b(decision|choice|move)\b",
 ]
 
 UNCERTAINTY_WORDS = [
@@ -58,15 +59,10 @@ DECISION_WORDS = [
 ]
 
 
-def _heuristic_classify(task: str) -> Classification | None:
-    """
-    Fast rule-based classification. Returns None if uncertain.
-    No API call. Instant.
-    """
+def _heuristic_classify(task: str):
     task_lower = task.lower().strip()
     words = task_lower.split()
 
-    # Check hard System 1 patterns
     for pattern in SYSTEM1_PATTERNS:
         if re.search(pattern, task_lower):
             return Classification(
@@ -77,7 +73,6 @@ def _heuristic_classify(task: str) -> Classification | None:
                 source="heuristic"
             )
 
-    # Check hard System 2 patterns
     for pattern in SYSTEM2_PATTERNS:
         if re.search(pattern, task_lower):
             return Classification(
@@ -88,34 +83,21 @@ def _heuristic_classify(task: str) -> Classification | None:
                 source="heuristic"
             )
 
-    # Heuristic signals
     score = 0
-
-    # Length signal — longer tasks tend to be more complex
     if len(words) > 20:
         score += 2
     elif len(words) > 10:
         score += 1
 
-    # Uncertainty words
-    uncertainty_count = sum(1 for w in UNCERTAINTY_WORDS if w in task_lower)
-    score += uncertainty_count * 2
+    score += sum(1 for w in UNCERTAINTY_WORDS if w in task_lower) * 2
+    score += sum(1 for w in DECISION_WORDS if w in task_lower) * 2
 
-    # Decision words
-    decision_count = sum(1 for w in DECISION_WORDS if w in task_lower)
-    score += decision_count * 2
-
-    # Multiple questions
-    question_count = task.count("?")
-    if question_count > 1:
+    if task.count("?") > 1:
         score += 2
 
-    # Sub-clauses suggest complexity
     clause_markers = ["because", "however", "although", "therefore", "given that"]
-    clause_count = sum(1 for c in clause_markers if c in task_lower)
-    score += clause_count
+    score += sum(1 for c in clause_markers if c in task_lower)
 
-    # Clear signal
     if score >= 4:
         return Classification(
             mode="system2",
@@ -133,11 +115,8 @@ def _heuristic_classify(task: str) -> Classification | None:
             source="heuristic"
         )
 
-    # Uncertain — let LLM decide
     return None
 
-
-# --- Layer 2: LLM classifier (fallback only) ---
 
 CLASSIFIER_PROMPT = """You are a task complexity classifier.
 
@@ -156,7 +135,6 @@ Return ONLY valid JSON. Nothing else."""
 
 
 def _llm_classify(task: str) -> Classification:
-    """LLM fallback for ambiguous tasks."""
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
     messages = [
         SystemMessage(content=CLASSIFIER_PROMPT),
@@ -180,15 +158,35 @@ def _llm_classify(task: str) -> Classification:
     )
 
 
-# --- Public API ---
-
 def classify(task: str) -> Classification:
     """
-    Hybrid classifier. Heuristics first, LLM only if needed.
+    Hybrid classifier. Three layers:
+    0. Procedural memory (learned patterns)
+    1. Heuristics (hardcoded rules)
+    2. LLM fallback
     """
-    result = _heuristic_classify(task)
+    # Layer 0 — Procedural memory
+    try:
+        from kairos.core.memory.procedural import apply_to_classifier
+        from kairos.core.memory.semantic import initialize as init_semantic
+        init_semantic()
+        learned, pattern_id = apply_to_classifier(task)
+        if learned:
+            return Classification(
+                mode=learned,
+                confidence=0.85,
+                reasoning="Matched learned pattern from past experience",
+                requires_citation=learned == "system2",
+                source="procedural_memory",
+                pattern_id=pattern_id
+            )
+    except Exception:
+        pass
 
+    # Layer 1 — Heuristics
+    result = _heuristic_classify(task)
     if result is not None:
         return result
 
+    # Layer 2 — LLM fallback
     return _llm_classify(task)
